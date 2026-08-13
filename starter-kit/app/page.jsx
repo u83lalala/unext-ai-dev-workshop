@@ -1,6 +1,6 @@
 'use client';
 
-// 這是你的網站首頁 —— 六頂思考帽煩惱諮詢室
+// 這是你的網站首頁 —— 六頂思考帽諮詢室
 //
 // 三種決定「問誰」的方式，優先順序由上到下：
 // 1. 輸入框裡打 @帽名（例如 @白帽），該次送出只問這頂帽子
@@ -13,12 +13,20 @@
 // 「同一個煩惱」的邊界由你自己決定：按下「結束這個煩惱，存到 Notion」，
 // 從上一個邊界到這裡之間的所有輪次會被打包存成 Notion 的一則新頁面
 //
+// 對話內容會自動存進瀏覽器的 localStorage 當草稿 —— 這只是「不小心重新整理」的
+// 安全網，不是真正的備份：換電腦、清瀏覽器資料都會不見。真正的存檔還是要按
+// 「結束這個煩惱，存到 Notion」
+//
 // 每頂帽子的角色設定在 app/api/ai/route.js 的 HAT_PROMPTS（伺服器端）
 // Notion 的存檔邏輯在 app/api/notion/route.js（伺服器端）
 
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 
 const APP_TITLE = '六頂思考帽諮詢室';
+
+// 草稿存在瀏覽器 localStorage 的 key。如果以後想強制大家的草稿重來一次
+// （例如資料結構改了），把版本號改成 v2 就好，舊的 v1 會被當成沒有草稿
+const STORAGE_KEY = 'six-hats-draft-v1';
 
 // 👇 六頂帽子的顯示資訊（名字、頭像、配色）
 // 角色的「思考邏輯」不在這裡 —— 在 app/api/ai/route.js 的 HAT_PROMPTS（伺服器端）
@@ -33,6 +41,38 @@ const HATS = [
 
 const NAME_TO_ID = { 白帽: 'white', 紅帽: 'red', 黑帽: 'black', 黃帽: 'yellow', 綠帽: 'green', 藍帽: 'blue' };
 const MENTION_PREFIX = /^@(白帽|紅帽|黑帽|黃帽|綠帽|藍帽)\s*/;
+
+// ────────────────────────────────────────────
+// 讀寫草稿：只在瀏覽器端執行（伺服器端 render 時 window 不存在，要先擋掉）
+// ────────────────────────────────────────────
+function loadDraft() {
+  if (typeof window === 'undefined') return null;
+  try {
+    const raw = window.localStorage.getItem(STORAGE_KEY);
+    if (!raw) return null;
+    const parsed = JSON.parse(raw);
+    if (!parsed || !Array.isArray(parsed.rounds)) return null;
+    return parsed;
+  } catch (_) {
+    return null; // 草稿壞掉就當作沒有，不要讓整頁掛掉
+  }
+}
+
+function saveDraft(data) {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
+  } catch (_) {
+    // localStorage 滿了或被瀏覽器擋掉，安靜失敗就好，不影響主要功能
+  }
+}
+
+function clearDraft() {
+  if (typeof window === 'undefined') return;
+  try {
+    window.localStorage.removeItem(STORAGE_KEY);
+  } catch (_) {}
+}
 
 // ────────────────────────────────────────────
 // 輕量 markdown 轉換：不裝套件，自己處理常見的幾種語法
@@ -116,19 +156,45 @@ function renderMarkdown(text) {
 }
 
 export default function Home() {
+  // rounds / sessionStart / sessionAskedAt 一開始一律從空白狀態起手，
+  // 不能在這裡就試著讀 localStorage —— 這支頁面會先在伺服器端組一次
+  // （伺服器上沒有 localStorage），如果這裡就讀，會跟瀏覽器端讀到的
+  // 結果對不起來，React 會直接放棄瀏覽器端讀到的草稿
+  const [rounds, setRounds] = useState([]);
+  const [sessionStart, setSessionStart] = useState(0);
+  const [sessionAskedAt, setSessionAskedAt] = useState(null);
+
+  // 草稿是不是已經從 localStorage 讀回來了 —— 讀回來之前，不能讓下面
+  // 「自動存檔」的 effect 搶先把空白內容寫回去，蓋掉原本的草稿
+  const [hydrated, setHydrated] = useState(false);
+
   const [input, setInput] = useState('');
-  const [rounds, setRounds] = useState([]); // { type:'round', worry, mode, results } | { type:'checkpoint', title, url, savedAt }
   const [busy, setBusy] = useState(false);
   const [selectedHat, setSelectedHat] = useState(null); // 按鈕選的預設帽子，null = 全部六頂
   const [mention, setMention] = useState({ open: false, query: '', start: 0, highlight: 0 });
   const isComposingRef = useRef(false);
   const textareaRef = useRef(null);
 
-  // 目前這個「還沒存檔」的煩惱，從 rounds 陣列的第幾格開始
-  const [sessionStart, setSessionStart] = useState(0);
-  const [sessionAskedAt, setSessionAskedAt] = useState(null);
   const [notionStatus, setNotionStatus] = useState('idle'); // idle | saving | error
   const [notionError, setNotionError] = useState('');
+
+  // 頁面在瀏覽器上準備好之後，才去讀 localStorage 裡的草稿
+  useEffect(() => {
+    const draft = loadDraft();
+    if (draft) {
+      setRounds(draft.rounds ?? []);
+      setSessionStart(draft.sessionStart ?? 0);
+      setSessionAskedAt(draft.sessionAskedAt ?? null);
+    }
+    setHydrated(true);
+  }, []);
+
+  // 對話內容有任何變動，就自動把草稿寫回 localStorage
+  // 但要等草稿讀回來之後（hydrated = true）才開始寫，不然會用空白狀態蓋掉舊草稿
+  useEffect(() => {
+    if (!hydrated) return;
+    saveDraft({ rounds, sessionStart, sessionAskedAt });
+  }, [hydrated, rounds, sessionStart, sessionAskedAt]);
 
   const filteredMentionHats = HATS.filter((h) => h.name.includes(mention.query));
 
@@ -137,9 +203,7 @@ export default function Home() {
     : '說說你的煩惱⋯⋯（可以打 @ 指定要問哪一頂帽子）';
 
   // 目前這個煩惱裡，有多少輪已經完成（用來判斷「存到 Notion」按鈕能不能按）
-  const sessionRounds = rounds
-    .slice(sessionStart)
-    .filter((r) => r.type === 'round');
+  const sessionRounds = rounds.slice(sessionStart).filter((r) => r.type === 'round');
   const hasUnsavedContent = sessionRounds.some((r) =>
     Object.values(r.results).some((res) => res.status === 'done')
   );
@@ -328,6 +392,16 @@ export default function Home() {
     }
   }
 
+  // 手動清空草稿：不會動到已經存進 Notion 的資料，只是把瀏覽器裡的暫存清乾淨
+  function handleClearDraft() {
+    const ok = window.confirm('確定要清空目前畫面上的對話嗎？已經存到 Notion 的內容不會受影響。');
+    if (!ok) return;
+    setRounds([]);
+    setSessionStart(0);
+    setSessionAskedAt(null);
+    clearDraft();
+  }
+
   function handleKeyDown(e) {
     // @ 選單開著的時候，方向鍵/Enter/Tab/Esc 先給選單用
     if (mention.open && filteredMentionHats.length > 0) {
@@ -366,11 +440,21 @@ export default function Home() {
   return (
     <main style={S.page}>
       <header style={S.header}>
-        <h1 style={S.h1}>{APP_TITLE}</h1>
-        <p style={S.sub}>
-          說一個你的煩惱 —— 打 <code>@</code> 指定一頂帽子聊、或用下面按鈕選、不選就六頂一起問。
-          帽子會記得自己講過什麼，可以接著聊；聊完按「結束這個煩惱」存進 Notion
-        </p>
+        <div style={S.headerTop}>
+          <div>
+            <h1 style={S.h1}>{APP_TITLE}</h1>
+            <p style={S.sub}>
+              說一個你的煩惱 —— 打 <code>@</code> 指定一頂帽子聊、或用下面按鈕選、不選就六頂一起問。
+              帽子會記得自己講過什麼，可以接著聊；聊完按「結束這個煩惱」存進 Notion
+            </p>
+          </div>
+          {rounds.length > 0 && (
+            <button type="button" onClick={handleClearDraft} style={S.clearButton}>
+              清空重新開始
+            </button>
+          )}
+        </div>
+        {rounds.length > 0 && <p style={S.draftHint}>💾 草稿自動儲存在這台瀏覽器裡</p>}
       </header>
 
       <section style={S.body}>
@@ -554,8 +638,21 @@ const S = {
     boxSizing: 'border-box',
   },
   header: { paddingTop: '2.5rem', paddingBottom: '1rem' },
+  headerTop: { display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', gap: '1rem' },
   h1: { fontSize: '1.6rem', margin: 0, marginBottom: '0.35rem', color: '#30302E' },
   sub: { color: '#8A8A85', margin: 0, fontSize: '0.95rem' },
+  draftHint: { color: '#B0AFA8', fontSize: '0.8rem', margin: '0.6rem 0 0' },
+  clearButton: {
+    flexShrink: 0,
+    padding: '0.4rem 0.8rem',
+    borderRadius: 999,
+    border: '1px solid #E5E3DB',
+    background: '#FFFFFF',
+    color: '#8A8A85',
+    fontSize: '0.8rem',
+    cursor: 'pointer',
+    whiteSpace: 'nowrap',
+  },
 
   body: { flex: 1, display: 'flex', flexDirection: 'column', gap: '2rem', paddingBottom: '1.5rem' },
   emptyState: { color: '#B0AFA8', fontSize: '0.95rem', textAlign: 'center', marginTop: '3rem' },
