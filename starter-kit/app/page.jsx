@@ -18,6 +18,7 @@ export default function Home() {
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState('');
   const bottomRef = useRef(null);
+  const isComposingRef = useRef(false); // 追蹤中文輸入法是否正在選字
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
@@ -54,6 +55,8 @@ export default function Home() {
 
   function handleKeyDown(e) {
     if (e.key === 'Enter' && !e.shiftKey) {
+      // 中文（或其他）輸入法選字中按 Enter 是在確認選字，不是要送出
+      if (isComposingRef.current || e.nativeEvent.isComposing) return;
       e.preventDefault();
       handleSubmit(e);
     }
@@ -104,6 +107,8 @@ export default function Home() {
           value={input}
           onChange={(e) => setInput(e.target.value)}
           onKeyDown={handleKeyDown}
+          onCompositionStart={() => { isComposingRef.current = true; }}
+          onCompositionEnd={() => { isComposingRef.current = false; }}
           placeholder={PLACEHOLDER}
           rows={1}
           style={S.textarea}
