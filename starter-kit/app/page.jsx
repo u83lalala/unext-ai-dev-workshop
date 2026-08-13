@@ -18,7 +18,7 @@
 
 import { useState, useRef } from 'react';
 
-const APP_TITLE = '六頂思考帽煩惱諮詢室';
+const APP_TITLE = '六頂思考帽諮詢室';
 
 // 👇 六頂帽子的顯示資訊（名字、頭像、配色）
 // 角色的「思考邏輯」不在這裡 —— 在 app/api/ai/route.js 的 HAT_PROMPTS（伺服器端）
