@@ -125,4 +125,35 @@ export async function POST(request) {
       headers: {
         Authorization: `Bearer ${apiKey}`,
         'Content-Type': 'application/json',
-        // ⚠️ 這行不能拿掉 —— 少了
+        // ⚠️ 這行不能拿掉 —— 少了 User-Agent，Groq 會回 403
+        'User-Agent': 'unext-ai-dev-workshop/1.0',
+      },
+      body: JSON.stringify({
+        model: 'llama-3.3-70b-versatile',
+        messages: [
+          {
+            role: 'system',
+            content: systemPrompt,
+          },
+          ...priorMessages,
+          { role: 'user', content: userContent },
+        ],
+        max_completion_tokens: 500,
+      }),
+    });
+
+    if (!res.ok) {
+      const detail = await res.text();
+      return Response.json(
+        { error: `Groq 回了 ${res.status}`, detail: detail.slice(0, 500) },
+        { status: 502 }
+      );
+    }
+
+    const data = await res.json();
+    const output = data.choices?.[0]?.message?.content ?? '(AI 沒有回傳內容)';
+    return Response.json({ output, hat, hatName: HAT_NAMES[hat] });
+  } catch (err) {
+    return Response.json({ error: `呼叫失敗：${err.message}` }, { status: 500 });
+  }
+}
