@@ -2,13 +2,15 @@
 
 // 這是你的網站首頁 —— 六頂思考帽煩惱諮詢室
 //
-// 送出一個煩惱後，會同時打 6 支請求（一頂帽子一支），
-// 每頂帽子的角色設定在 app/api/ai/route.js 的 HAT_PROMPTS
+// 兩種模式：
+// 1. 「全部六頂」：送出一個煩惱，同時打 6 支請求，六張卡片並排顯示
+// 2. 指定某一頂帽子：之後的對話只問那頂帽子，用聊天氣泡連續呈現
+//
+// 每頂帽子的角色設定在 app/api/ai/route.js 的 HAT_PROMPTS（伺服器端）
 
 import { useState } from 'react';
 
 const APP_TITLE = '六頂思考帽煩惱諮詢室';
-const PLACEHOLDER = '說說你的煩惱⋯⋯';
 
 // 👇 六頂帽子的顯示資訊（名字、頭像、配色）
 // 角色的「思考邏輯」不在這裡 —— 在 app/api/ai/route.js 的 HAT_PROMPTS（伺服器端）
@@ -21,11 +23,98 @@ const HATS = [
   { id: 'blue', name: '藍帽', desc: '統籌總結', avatar: '🔵', bg: '#EAF1F6', accent: '#4A7A96' },
 ];
 
+// ────────────────────────────────────────────
+// 輕量 markdown 轉換：不裝套件，自己處理常見的幾種語法
+// 支援：**粗體**、`行內程式碼`、* 條列 / - 條列、1. 編號列表、# 標題、換行
+// ────────────────────────────────────────────
+function renderInline(text, keyPrefix) {
+  const nodes = [];
+  const regex = /(\*\*(.+?)\*\*|`(.+?)`)/g;
+  let lastIndex = 0;
+  let match;
+  let i = 0;
+  while ((match = regex.exec(text))) {
+    if (match.index > lastIndex) nodes.push(text.slice(lastIndex, match.index));
+    if (match[2] !== undefined) {
+      nodes.push(<strong key={`${keyPrefix}-${i++}`}>{match[2]}</strong>);
+    } else if (match[3] !== undefined) {
+      nodes.push(
+        <code key={`${keyPrefix}-${i++}`} style={S.inlineCode}>
+          {match[3]}
+        </code>
+      );
+    }
+    lastIndex = regex.lastIndex;
+  }
+  if (lastIndex < text.length) nodes.push(text.slice(lastIndex));
+  return nodes;
+}
+
+function renderMarkdown(text) {
+  if (!text) return null;
+  const blocks = text.trim().split(/\n\s*\n/);
+
+  return blocks.map((block, bi) => {
+    const lines = block.split('\n').map((l) => l.trim()).filter(Boolean);
+    const isBulletList = lines.length > 0 && lines.every((l) => /^[-*]\s+/.test(l));
+    const isNumberList = lines.length > 0 && lines.every((l) => /^\d+\.\s+/.test(l));
+    const headerMatch = block.match(/^(#{1,3})\s+(.*)$/);
+
+    if (isBulletList) {
+      return (
+        <ul key={bi} style={S.mdList}>
+          {lines.map((l, li) => (
+            <li key={li}>{renderInline(l.replace(/^[-*]\s+/, ''), `${bi}-${li}`)}</li>
+          ))}
+        </ul>
+      );
+    }
+
+    if (isNumberList) {
+      return (
+        <ol key={bi} style={S.mdList}>
+          {lines.map((l, li) => (
+            <li key={li}>{renderInline(l.replace(/^\d+\.\s+/, ''), `${bi}-${li}`)}</li>
+          ))}
+        </ol>
+      );
+    }
+
+    if (headerMatch) {
+      const level = headerMatch[1].length;
+      const style = level === 1 ? S.mdH1 : level === 2 ? S.mdH2 : S.mdH3;
+      return (
+        <div key={bi} style={style}>
+          {renderInline(headerMatch[2], `${bi}-h`)}
+        </div>
+      );
+    }
+
+    const paraLines = block.split('\n');
+    return (
+      <p key={bi} style={S.mdP}>
+        {paraLines.map((l, li) => (
+          <span key={li}>
+            {renderInline(l, `${bi}-p-${li}`)}
+            {li < paraLines.length - 1 && <br />}
+          </span>
+        ))}
+      </p>
+    );
+  });
+}
+
 export default function Home() {
   const [input, setInput] = useState('');
-  const [rounds, setRounds] = useState([]); // { worry, results: { hatId: { status, text } } }
+  const [rounds, setRounds] = useState([]); // { worry, mode: 'all' | hatId, results }
   const [busy, setBusy] = useState(false);
+  const [selectedHat, setSelectedHat] = useState(null); // null = 全部六頂
   const isComposingRef = { current: false };
+
+  const activeHats = selectedHat ? HATS.filter((h) => h.id === selectedHat) : HATS;
+  const placeholder = selectedHat
+    ? `跟${HATS.find((h) => h.id === selectedHat)?.name}聊聊你的煩惱⋯⋯`
+    : '說說你的煩惱⋯⋯';
 
   async function handleSubmit(e) {
     e.preventDefault();
@@ -35,17 +124,17 @@ export default function Home() {
     setBusy(true);
     setInput('');
 
+    const mode = selectedHat || 'all';
     const initialResults = {};
-    HATS.forEach((h) => {
+    activeHats.forEach((h) => {
       initialResults[h.id] = { status: 'loading', text: '' };
     });
 
     const roundIndex = rounds.length;
-    setRounds((prev) => [...prev, { worry, results: initialResults }]);
+    setRounds((prev) => [...prev, { worry, mode, results: initialResults }]);
 
-    // 六頂帽子平行送出，各自回來各自更新，不互相等待
     await Promise.all(
-      HATS.map(async (h) => {
+      activeHats.map(async (h) => {
         try {
           const res = await fetch('/api/ai', {
             method: 'POST',
@@ -97,7 +186,9 @@ export default function Home() {
     <main style={S.page}>
       <header style={S.header}>
         <h1 style={S.h1}>{APP_TITLE}</h1>
-        <p style={S.sub}>說一個你的煩惱，六頂思考帽會分別給你不同角度的回應</p>
+        <p style={S.sub}>
+          說一個你的煩惱 —— 選「全部六頂」一起看，或指定一頂帽子連續聊
+        </p>
       </header>
 
       <section style={S.body}>
@@ -111,30 +202,77 @@ export default function Home() {
               <div style={S.worryBubble}>{r.worry}</div>
             </div>
 
-            <div style={S.hatsGrid}>
-              {HATS.map((h) => {
-                const result = r.results[h.id];
-                return (
-                  <div key={h.id} style={{ ...S.card, background: h.bg, borderColor: h.accent }}>
-                    <div style={S.cardHeader}>
-                      <span style={S.avatar}>{h.avatar}</span>
-                      <div>
-                        <div style={{ ...S.hatName, color: h.accent }}>{h.name}</div>
-                        <div style={S.hatDesc}>{h.desc}</div>
+            {r.mode === 'all' ? (
+              <div style={S.hatsGrid}>
+                {HATS.map((h) => {
+                  const result = r.results[h.id];
+                  return (
+                    <div key={h.id} style={{ ...S.card, background: h.bg, borderColor: h.accent }}>
+                      <div style={S.cardHeader}>
+                        <span style={S.avatar}>{h.avatar}</span>
+                        <div>
+                          <div style={{ ...S.hatName, color: h.accent }}>{h.name}</div>
+                          <div style={S.hatDesc}>{h.desc}</div>
+                        </div>
+                      </div>
+                      <div style={S.cardBody}>
+                        {result.status === 'loading' && <span style={S.thinking}>思考中⋯⋯</span>}
+                        {result.status === 'error' && <span style={S.errText}>{result.text}</span>}
+                        {result.status === 'done' && renderMarkdown(result.text)}
                       </div>
                     </div>
-                    <div style={S.cardBody}>
+                  );
+                })}
+              </div>
+            ) : (
+              (() => {
+                const h = HATS.find((x) => x.id === r.mode);
+                const result = r.results[r.mode];
+                return (
+                  <div style={S.singleRow}>
+                    <span style={S.avatarSmall}>{h.avatar}</span>
+                    <div style={{ ...S.singleBubble, borderColor: h.accent, background: h.bg }}>
+                      <div style={{ ...S.hatName, color: h.accent, marginBottom: '0.3rem' }}>
+                        {h.name}
+                      </div>
                       {result.status === 'loading' && <span style={S.thinking}>思考中⋯⋯</span>}
                       {result.status === 'error' && <span style={S.errText}>{result.text}</span>}
-                      {result.status === 'done' && result.text}
+                      {result.status === 'done' && renderMarkdown(result.text)}
                     </div>
                   </div>
                 );
-              })}
-            </div>
+              })()
+            )}
           </div>
         ))}
       </section>
+
+      {/* 帽子選擇列：選「全部六頂」或指定一頂帽子連續聊 */}
+      <div style={S.hatPicker}>
+        <button
+          type="button"
+          onClick={() => setSelectedHat(null)}
+          style={{
+            ...S.chip,
+            ...(selectedHat === null ? S.chipActive : {}),
+          }}
+        >
+          全部六頂
+        </button>
+        {HATS.map((h) => (
+          <button
+            key={h.id}
+            type="button"
+            onClick={() => setSelectedHat(h.id)}
+            style={{
+              ...S.chip,
+              ...(selectedHat === h.id ? { ...S.chipActive, borderColor: h.accent, color: h.accent } : {}),
+            }}
+          >
+            {h.avatar} {h.name}
+          </button>
+        ))}
+      </div>
 
       <form onSubmit={handleSubmit} style={S.inputBar}>
         <textarea
@@ -143,13 +281,13 @@ export default function Home() {
           onKeyDown={handleKeyDown}
           onCompositionStart={() => { isComposingRef.current = true; }}
           onCompositionEnd={() => { isComposingRef.current = false; }}
-          placeholder={PLACEHOLDER}
+          placeholder={placeholder}
           rows={2}
           style={S.textarea}
           disabled={busy}
         />
         <button type="submit" disabled={busy || !input.trim()} style={S.button}>
-          {busy ? '六頂帽子思考中⋯' : '送出'}
+          {busy ? '思考中⋯' : '送出'}
         </button>
       </form>
 
@@ -200,18 +338,58 @@ const S = {
     gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
     gap: '0.9rem',
   },
-  card: {
-    border: '1px solid',
-    borderRadius: 14,
-    padding: '1rem 1.1rem',
-  },
+  card: { border: '1px solid', borderRadius: 14, padding: '1rem 1.1rem' },
   cardHeader: { display: 'flex', alignItems: 'center', gap: '0.6rem', marginBottom: '0.6rem' },
   avatar: { fontSize: '1.4rem' },
+  avatarSmall: { fontSize: '1.3rem', flexShrink: 0, marginTop: '0.3rem' },
   hatName: { fontSize: '0.95rem', fontWeight: 700 },
   hatDesc: { fontSize: '0.78rem', color: '#8A8A85' },
-  cardBody: { fontSize: '0.92rem', lineHeight: 1.65, whiteSpace: 'pre-wrap', color: '#3D3D3A' },
+  cardBody: { fontSize: '0.92rem', color: '#3D3D3A' },
   thinking: { color: '#9A9990', fontStyle: 'italic' },
   errText: { color: '#8A3B2E' },
+
+  singleRow: { display: 'flex', gap: '0.6rem', alignItems: 'flex-start' },
+  singleBubble: {
+    maxWidth: '78%',
+    border: '1px solid',
+    borderRadius: '4px 16px 16px 16px',
+    padding: '0.7rem 1rem',
+    fontSize: '0.95rem',
+  },
+
+  // markdown 元素樣式
+  mdP: { margin: '0 0 0.5rem', lineHeight: 1.65 },
+  mdList: { margin: '0 0 0.5rem', paddingLeft: '1.3rem', lineHeight: 1.65 },
+  mdH1: { fontSize: '1.05rem', fontWeight: 700, margin: '0 0 0.4rem' },
+  mdH2: { fontSize: '1rem', fontWeight: 700, margin: '0 0 0.4rem' },
+  mdH3: { fontSize: '0.95rem', fontWeight: 700, margin: '0 0 0.4rem' },
+  inlineCode: {
+    background: 'rgba(0,0,0,0.06)',
+    borderRadius: 4,
+    padding: '0.1rem 0.35rem',
+    fontSize: '0.9em',
+  },
+
+  hatPicker: {
+    display: 'flex',
+    flexWrap: 'wrap',
+    gap: '0.5rem',
+    padding: '0.6rem 0.2rem',
+  },
+  chip: {
+    padding: '0.4rem 0.8rem',
+    borderRadius: 999,
+    border: '1px solid #E5E3DB',
+    background: '#FFFFFF',
+    color: '#8A8A85',
+    fontSize: '0.85rem',
+    cursor: 'pointer',
+  },
+  chipActive: {
+    borderColor: '#CC785C',
+    color: '#CC785C',
+    fontWeight: 700,
+  },
 
   inputBar: {
     position: 'sticky',
