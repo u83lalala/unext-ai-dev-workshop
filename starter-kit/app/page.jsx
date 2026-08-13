@@ -10,7 +10,11 @@
 // 每頂帽子會記得「自己」跟你聊過的內容（不管是六頂一起問，還是單獨被 @），
 // 所以可以先看六頂的第一輪回應，再指定某一頂繼續往下聊
 //
+// 「同一個煩惱」的邊界由你自己決定：按下「結束這個煩惱，存到 Notion」，
+// 從上一個邊界到這裡之間的所有輪次會被打包存成 Notion 的一則新頁面
+//
 // 每頂帽子的角色設定在 app/api/ai/route.js 的 HAT_PROMPTS（伺服器端）
+// Notion 的存檔邏輯在 app/api/notion/route.js（伺服器端）
 
 import { useState, useRef } from 'react';
 
@@ -113,12 +117,18 @@ function renderMarkdown(text) {
 
 export default function Home() {
   const [input, setInput] = useState('');
-  const [rounds, setRounds] = useState([]); // { worry, mode: 'all' | hatId, results }
+  const [rounds, setRounds] = useState([]); // { type:'round', worry, mode, results } | { type:'checkpoint', title, url, savedAt }
   const [busy, setBusy] = useState(false);
   const [selectedHat, setSelectedHat] = useState(null); // 按鈕選的預設帽子，null = 全部六頂
   const [mention, setMention] = useState({ open: false, query: '', start: 0, highlight: 0 });
   const isComposingRef = useRef(false);
   const textareaRef = useRef(null);
+
+  // 目前這個「還沒存檔」的煩惱，從 rounds 陣列的第幾格開始
+  const [sessionStart, setSessionStart] = useState(0);
+  const [sessionAskedAt, setSessionAskedAt] = useState(null);
+  const [notionStatus, setNotionStatus] = useState('idle'); // idle | saving | error
+  const [notionError, setNotionError] = useState('');
 
   const filteredMentionHats = HATS.filter((h) => h.name.includes(mention.query));
 
@@ -126,11 +136,20 @@ export default function Home() {
     ? `跟${HATS.find((h) => h.id === selectedHat)?.name}聊聊你的煩惱⋯⋯（也可以打 @ 換一頂）`
     : '說說你的煩惱⋯⋯（可以打 @ 指定要問哪一頂帽子）';
 
+  // 目前這個煩惱裡，有多少輪已經完成（用來判斷「存到 Notion」按鈕能不能按）
+  const sessionRounds = rounds
+    .slice(sessionStart)
+    .filter((r) => r.type === 'round');
+  const hasUnsavedContent = sessionRounds.some((r) =>
+    Object.values(r.results).some((res) => res.status === 'done')
+  );
+
   // 從之前所有回合裡，把「這頂帽子」講過的話整理成 user/assistant 交替的歷史紀錄
   // 只算已經回答完成（status === 'done'）的，並且只留最近幾輪，避免每次都送一長串
   function buildHistoryForHat(hatId, roundsSoFar) {
     const history = [];
     roundsSoFar.forEach((r) => {
+      if (r.type !== 'round') return;
       if (r.mode === 'all' || r.mode === hatId) {
         const result = r.results[hatId];
         if (result && result.status === 'done') {
@@ -196,8 +215,13 @@ export default function Home() {
     const mode = mentioned ? mentioned.hatId : (selectedHat || 'all');
     const activeHats = mode === 'all' ? HATS : HATS.filter((h) => h.id === mode);
 
-    // 這裡的 rounds 是「送出這次之前」的所有回合，拿來組每頂帽子各自的歷史紀錄
+    // 這裡的 rounds 是「送出這次之前」的所有內容，拿來組每頂帽子各自的歷史紀錄
     const roundsBeforeThis = rounds;
+
+    // 如果這是這個煩惱的第一輪，記下「問出去的時間」給 Notion 的日期屬性用
+    if (roundsBeforeThis.length === sessionStart) {
+      setSessionAskedAt(Date.now());
+    }
 
     setBusy(true);
     setInput('');
@@ -209,7 +233,7 @@ export default function Home() {
     });
 
     const roundIndex = roundsBeforeThis.length;
-    setRounds((prev) => [...prev, { worry, mode, results: initialResults }]);
+    setRounds((prev) => [...prev, { type: 'round', worry, mode, results: initialResults }]);
 
     await Promise.all(
       activeHats.map(async (h) => {
@@ -253,6 +277,57 @@ export default function Home() {
     setBusy(false);
   }
 
+  // 把「這個煩惱」目前累積的所有輪次整理成 Notion 要的格式，送去存檔
+  async function handleSaveToNotion() {
+    if (busy || notionStatus === 'saving' || !hasUnsavedContent) return;
+
+    const titleRound = sessionRounds[0];
+    const title = titleRound ? titleRound.worry : '（無標題的煩惱）';
+
+    const hatsPayload = {};
+    HATS.forEach((h) => {
+      const entries = [];
+      sessionRounds.forEach((r) => {
+        if (r.mode === 'all' || r.mode === h.id) {
+          const result = r.results[h.id];
+          if (result && result.status === 'done') {
+            entries.push({ worry: r.worry, text: result.text });
+          }
+        }
+      });
+      if (entries.length > 0) hatsPayload[h.id] = entries;
+    });
+
+    setNotionStatus('saving');
+    setNotionError('');
+
+    try {
+      const res = await fetch('/api/notion', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ title, askedAt: sessionAskedAt, hats: hatsPayload }),
+      });
+      const data = await res.json();
+      if (data.error) {
+        setNotionStatus('error');
+        setNotionError(data.error);
+        return;
+      }
+
+      // 存檔成功：在對話紀錄裡插入一個「邊界節點」，並把 session 起點推進到這裡
+      setRounds((prev) => [
+        ...prev,
+        { type: 'checkpoint', title: data.title, url: data.url, savedAt: Date.now() },
+      ]);
+      setSessionStart(rounds.length + 1); // +1 是因為剛插入的 checkpoint 本身也算一格
+      setSessionAskedAt(null);
+      setNotionStatus('idle');
+    } catch (err) {
+      setNotionStatus('error');
+      setNotionError(`存檔失敗：${err.message}`);
+    }
+  }
+
   function handleKeyDown(e) {
     // @ 選單開著的時候，方向鍵/Enter/Tab/Esc 先給選單用
     if (mention.open && filteredMentionHats.length > 0) {
@@ -294,7 +369,7 @@ export default function Home() {
         <h1 style={S.h1}>{APP_TITLE}</h1>
         <p style={S.sub}>
           說一個你的煩惱 —— 打 <code>@</code> 指定一頂帽子聊、或用下面按鈕選、不選就六頂一起問。
-          帽子會記得自己講過什麼，可以接著聊
+          帽子會記得自己講過什麼，可以接著聊；聊完按「結束這個煩惱」存進 Notion
         </p>
       </header>
 
@@ -303,63 +378,90 @@ export default function Home() {
           <div style={S.emptyState}>還沒有煩惱被討論，在下面輸入開始吧</div>
         )}
 
-        {rounds.map((r, i) => (
-          <div key={i} style={S.round}>
-            <div style={S.worryRow}>
-              <div style={S.worryBubble}>
-                {r.mode !== 'all' && (
-                  <span style={S.mentionTag}>
-                    @{HATS.find((h) => h.id === r.mode)?.name}
-                  </span>
-                )}
-                {r.worry}
+        {rounds.map((r, i) => {
+          if (r.type === 'checkpoint') {
+            return (
+              <div key={i} style={S.checkpointRow}>
+                <div style={S.checkpointLine} />
+                <a href={r.url} target="_blank" rel="noopener noreferrer" style={S.checkpointPill}>
+                  ✅ 已存到 Notion：{r.title}
+                </a>
+                <div style={S.checkpointLine} />
               </div>
-            </div>
+            );
+          }
 
-            {r.mode === 'all' ? (
-              <div style={S.hatsGrid}>
-                {HATS.map((h) => {
-                  const result = r.results[h.id];
-                  return (
-                    <div key={h.id} style={{ ...S.card, background: h.bg, borderColor: h.accent }}>
-                      <div style={S.cardHeader}>
-                        <span style={S.avatar}>{h.avatar}</span>
-                        <div>
-                          <div style={{ ...S.hatName, color: h.accent }}>{h.name}</div>
-                          <div style={S.hatDesc}>{h.desc}</div>
+          return (
+            <div key={i} style={S.round}>
+              <div style={S.worryRow}>
+                <div style={S.worryBubble}>
+                  {r.mode !== 'all' && (
+                    <span style={S.mentionTag}>@{HATS.find((h) => h.id === r.mode)?.name}</span>
+                  )}
+                  {r.worry}
+                </div>
+              </div>
+
+              {r.mode === 'all' ? (
+                <div style={S.hatsGrid}>
+                  {HATS.map((h) => {
+                    const result = r.results[h.id];
+                    return (
+                      <div key={h.id} style={{ ...S.card, background: h.bg, borderColor: h.accent }}>
+                        <div style={S.cardHeader}>
+                          <span style={S.avatar}>{h.avatar}</span>
+                          <div>
+                            <div style={{ ...S.hatName, color: h.accent }}>{h.name}</div>
+                            <div style={S.hatDesc}>{h.desc}</div>
+                          </div>
+                        </div>
+                        <div style={S.cardBody}>
+                          {result.status === 'loading' && <span style={S.thinking}>思考中⋯⋯</span>}
+                          {result.status === 'error' && <span style={S.errText}>{result.text}</span>}
+                          {result.status === 'done' && renderMarkdown(result.text)}
                         </div>
                       </div>
-                      <div style={S.cardBody}>
+                    );
+                  })}
+                </div>
+              ) : (
+                (() => {
+                  const h = HATS.find((x) => x.id === r.mode);
+                  const result = r.results[r.mode];
+                  return (
+                    <div style={S.singleRow}>
+                      <span style={S.avatarSmall}>{h.avatar}</span>
+                      <div style={{ ...S.singleBubble, borderColor: h.accent, background: h.bg }}>
+                        <div style={{ ...S.hatName, color: h.accent, marginBottom: '0.3rem' }}>
+                          {h.name}
+                        </div>
                         {result.status === 'loading' && <span style={S.thinking}>思考中⋯⋯</span>}
                         {result.status === 'error' && <span style={S.errText}>{result.text}</span>}
                         {result.status === 'done' && renderMarkdown(result.text)}
                       </div>
                     </div>
                   );
-                })}
-              </div>
-            ) : (
-              (() => {
-                const h = HATS.find((x) => x.id === r.mode);
-                const result = r.results[r.mode];
-                return (
-                  <div style={S.singleRow}>
-                    <span style={S.avatarSmall}>{h.avatar}</span>
-                    <div style={{ ...S.singleBubble, borderColor: h.accent, background: h.bg }}>
-                      <div style={{ ...S.hatName, color: h.accent, marginBottom: '0.3rem' }}>
-                        {h.name}
-                      </div>
-                      {result.status === 'loading' && <span style={S.thinking}>思考中⋯⋯</span>}
-                      {result.status === 'error' && <span style={S.errText}>{result.text}</span>}
-                      {result.status === 'done' && renderMarkdown(result.text)}
-                    </div>
-                  </div>
-                );
-              })()
-            )}
-          </div>
-        ))}
+                })()
+              )}
+            </div>
+          );
+        })}
       </section>
+
+      {/* 存到 Notion 的控制列：只有在這個煩惱有內容時才會出現 */}
+      {hasUnsavedContent && (
+        <div style={S.notionBar}>
+          <button
+            type="button"
+            onClick={handleSaveToNotion}
+            disabled={busy || notionStatus === 'saving'}
+            style={S.notionButton}
+          >
+            {notionStatus === 'saving' ? '存到 Notion 中⋯' : '結束這個煩惱，存到 Notion'}
+          </button>
+          {notionStatus === 'error' && <span style={S.notionErrText}>{notionError}</span>}
+        </div>
+      )}
 
       {/* 帽子選擇列：沒打 @ 的時候，這裡選的就是預設要問誰 */}
       <div style={S.hatPicker}>
@@ -504,6 +606,23 @@ const S = {
     fontSize: '0.95rem',
   },
 
+  checkpointRow: { display: 'flex', alignItems: 'center', gap: '0.8rem', margin: '0.5rem 0' },
+  checkpointLine: { flex: 1, height: 1, background: '#E5E3DB' },
+  checkpointPill: {
+    flexShrink: 0,
+    padding: '0.35rem 0.9rem',
+    borderRadius: 999,
+    background: '#EFF5EC',
+    color: '#5F8D5A',
+    fontSize: '0.82rem',
+    fontWeight: 600,
+    textDecoration: 'none',
+    whiteSpace: 'nowrap',
+    maxWidth: '60%',
+    overflow: 'hidden',
+    textOverflow: 'ellipsis',
+  },
+
   // markdown 元素樣式
   mdP: { margin: '0 0 0.5rem', lineHeight: 1.65 },
   mdList: { margin: '0 0 0.5rem', paddingLeft: '1.3rem', lineHeight: 1.65 },
@@ -516,6 +635,24 @@ const S = {
     padding: '0.1rem 0.35rem',
     fontSize: '0.9em',
   },
+
+  notionBar: {
+    display: 'flex',
+    alignItems: 'center',
+    gap: '0.8rem',
+    padding: '0.4rem 0.2rem 0.8rem',
+  },
+  notionButton: {
+    padding: '0.5rem 1rem',
+    borderRadius: 12,
+    border: '1px solid #CC785C',
+    background: '#FFF',
+    color: '#CC785C',
+    fontSize: '0.88rem',
+    fontWeight: 600,
+    cursor: 'pointer',
+  },
+  notionErrText: { color: '#8A3B2E', fontSize: '0.85rem' },
 
   hatPicker: {
     display: 'flex',
