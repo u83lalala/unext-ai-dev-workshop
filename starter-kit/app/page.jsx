@@ -7,6 +7,9 @@
 // 2. 輸入框上方的帽子按鈕選了某一頂 → 之後送出都只問那頂
 // 3. 兩者都沒選 → 六頂一起問
 //
+// 每頂帽子會記得「自己」跟你聊過的內容（不管是六頂一起問，還是單獨被 @），
+// 所以可以先看六頂的第一輪回應，再指定某一頂繼續往下聊
+//
 // 每頂帽子的角色設定在 app/api/ai/route.js 的 HAT_PROMPTS（伺服器端）
 
 import { useState, useRef } from 'react';
@@ -123,78 +126,10 @@ export default function Home() {
     ? `跟${HATS.find((h) => h.id === selectedHat)?.name}聊聊你的煩惱⋯⋯（也可以打 @ 換一頂）`
     : '說說你的煩惱⋯⋯（可以打 @ 指定要問哪一頂帽子）';
 
-  // 偵測游標前面是不是正在打 @提及：@ 之後、還沒出現空白之前，都算在打帽子名字
-  function detectMention(value, cursor) {
-    const uptoCursor = value.slice(0, cursor);
-    const atIndex = uptoCursor.lastIndexOf('@');
-    if (atIndex === -1) {
-      setMention({ open: false, query: '', start: 0, highlight: 0 });
-      return;
-    }
-    const before = uptoCursor[atIndex - 1];
-    const isValidStart = atIndex === 0 || before === ' ' || before === '\n';
-    const fragment = uptoCursor.slice(atIndex + 1);
-    if (!isValidStart || /\s/.test(fragment)) {
-      setMention({ open: false, query: '', start: 0, highlight: 0 });
-      return;
-    }
-    setMention({ open: true, query: fragment, start: atIndex, highlight: 0 });
-  }
-
-  function handleChange(e) {
-    const value = e.target.value;
-    setInput(value);
-    detectMention(value, e.target.selectionStart);
-  }
-
-  // 從選單挑一頂帽子，把 @查詢字串換成完整的 @帽名（後面補一個空白讓你接著打）
-  function selectMention(hat) {
-    const before = input.slice(0, mention.start);
-    const afterCursorIndex = mention.start + 1 + mention.query.length;
-    const after = input.slice(afterCursorIndex);
-    const newValue = `${before}@${hat.name} ${after}`;
-    setInput(newValue);
-    setMention({ open: false, query: '', start: 0, highlight: 0 });
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }
-
-  // 解析輸入開頭的 @帽名，回傳要問哪頂帽子、以及拿掉前綴後的實際內容
-  function parseMentionPrefix(text) {
-    const m = text.match(MENTION_PREFIX);
-    if (!m) return null;
-    return { hatId: NAME_TO_ID[m[1]], rest: text.slice(m[0].length).trim() };
-  }
-
-  async function handleSubmit(e) {
-    e.preventDefault();
-    const raw = input.trim();
-    if (!raw || busy) return;
-
-    const mentioned = parseMentionPrefix(raw);
-    const worry = mentioned ? mentioned.rest : raw;
-    if (!worry) return; // 只打了 @帽名沒接內容，先不送
-
-    const mode = mentioned ? mentioned.hatId : (selectedHat || 'all');
-    const activeHats = mode === 'all' ? HATS : HATS.filter((h) => h.id === mode);
-
-    setBusy(true);
-    setInput('');
-    setMention({ open: false, query: '', start: 0, highlight: 0 });
-
-    const initialResults = {};
-    activeHats.forEach((h) => {
-      initialResults[h.id] = { status: 'loading', text: '' };
-    });
-
-    const roundIndex = rounds.length;
-    setRounds((prev) => [...prev, { worry, mode, results: initialResults }]);
-
-    await Promise.all(
-      activeHats.map(async (h) => {
-        try {
-          const res = await fetch('/api/ai', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({ input: worry, hat: h.id }),
-          });
-          const data = await res.json();
+  // 從之前所有回合裡，把「這頂帽子」講過的話整理成 user/assistant 交替的歷史紀錄
+  // 只算已經回答完成（status === 'done'）的，並且只留最近幾輪，避免每次都送一長串
+  function buildHistoryForHat(hatId, roundsSoFar) {
+    const history = [];
+    roundsSoFar.forEach((r) => {
+      if (r.mode === 'all' || r.mode === hatId) {
+        const result =
